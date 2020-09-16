@@ -23,7 +23,7 @@ The neural network was trained on 2 separate datasets:
 1. [The MAESTRO Dataset](https://magenta.tensorflow.org/datasets/maestro), which contains over 200 hours of virtuosic piano performances in the format of MIDI files.
 2. [Fraudulent E-mail Corpus](https://www.kaggle.com/rtatman/fraudulent-email-corpus), which contains over 2,500 scam emails.
 
-Generated data for both datasets can be found **here**
+Generated data for both datasets can be found [here](https://github.com/davidsvy/transformer-xl/tree/master/generated_samples).
 
 <a name="dep"></a>
 
