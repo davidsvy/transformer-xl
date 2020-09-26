@@ -6,13 +6,16 @@ import os
 import joblib
 import glob
 import tqdm
+import pathlib
 from collections import Counter
+
+__all__ = ('MIDI_parser')
 
 
 class MIDI_parser():
 
     def __init__(self, tempo, ppq, numerator, denominator, clocks_per_click, notated_32nd_notes_per_beat,
-                 cc_kept, cc_threshold, cc_lower, cc_upper, n_notes, n_times, vel_value, idx_to_time, n_jobs):
+                 cc_kept, cc_threshold, cc_lower, cc_upper, n_notes, n_deltas, vel_value, idx_to_time, n_jobs):
 
         self.tempo = tempo
         self.ppq = ppq
@@ -28,27 +31,31 @@ class MIDI_parser():
 
         self.vel_value = vel_value
 
+        assert n_notes <= 128
+        assert 128 % n_notes == 0
+        self.note_ratio = 128 // n_notes
         self.n_notes = n_notes
+
         self.n_cc = 2 * len(self.cc_kept)
-        self.n_times = n_times
-        self.n_classes = 2 * self.n_notes + self.n_cc + self.n_times + 1
+
+        self.n_sounds = 2 * self.n_notes + self.n_cc + 1
+
+        self.n_deltas = n_deltas
 
         self.pad_idx = 0
         self.n_jobs = n_jobs
 
-        assert n_times == len(idx_to_time)
+        assert self.n_deltas - 1 == len(idx_to_time)
         assert idx_to_time[0] == 0
         assert np.sum(idx_to_time == 0) == 1
 
         self.idx_to_time = idx_to_time
+        self.closest_neighbors = [
+            (a + b) / 2 for a, b in zip(idx_to_time[1:-1], idx_to_time[2:])]
 
         self.note_on_offset = 1
         self.note_off_offset = self.note_on_offset + self.n_notes
         self.cc_offset = self.note_off_offset + self.n_notes
-        self.time_offset = self.cc_offset + self.n_cc
-
-        self.time_range = (self.time_offset, self.n_classes)
-        self.sound_range = (self.note_on_offset, self.time_offset)
 
     def secs_to_ticks(self, secs):
 
@@ -56,43 +63,50 @@ class MIDI_parser():
 
     def save_features(self, features, filename):
 
-        np.save(filename, features)
+        sounds, deltas = features
+
+        np.savez(filename, sounds=sounds, deltas=deltas)
 
     def load_features(self, filename):
 
-        return np.load(filename)
+        container = np.load(filename)
+        sounds = container['sounds']
+        deltas = container['deltas']
+
+        return sounds, deltas
 
     def midi_to_features(self, src_file):
 
         midi = mido.MidiFile(src_file)
-        encoded = []
+        sounds = []
+        deltas = []
 
         for msg in midi:
 
             if msg.time == 0:
-                time = 0
+                time = 1
             else:
-                time = 1 + np.clip(np.digitize(msg.time,
-                                               self.idx_to_time[1:]), 0, self.n_times - 2)
-            time += self.time_offset
+                time = 2 + np.digitize(msg.time, self.closest_neighbors)
 
             # note on
             if msg.type == 'note_on' and msg.velocity > 0:
 
                 note_on = msg.note
+                note_on = note_on // self.note_ratio
                 note_on += self.note_on_offset
 
-                encoded.append(time)
-                encoded.append(note_on)
+                sounds.append(note_on)
+                deltas.append(time)
 
             # note_off
             elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
 
                 note_off = msg.note
+                note_off = note_off // self.note_ratio
                 note_off += self.note_off_offset
 
-                encoded.append(time)
-                encoded.append(note_off)
+                sounds.append(note_off)
+                deltas.append(time)
 
             # control_change
             elif msg.type == 'control_change' and msg.control in self.cc_kept:
@@ -102,12 +116,18 @@ class MIDI_parser():
                 cc = control_idx * 2 + value
                 cc += self.cc_offset
 
-                encoded.append(time)
-                encoded.append(cc)
+                sounds.append(cc)
+                deltas.append(time)
 
-        return np.array(encoded).astype(np.uint16)
+        assert len(sounds) == len(deltas)
+        sounds = np.array(sounds).astype(np.uint16)
+        deltas = np.array(deltas).astype(np.uint8)
 
-    def features_to_midi(self, features):
+        return (sounds, deltas)
+
+    def features_to_midi(self, sounds, deltas):
+
+        assert len(sounds) == len(deltas)
 
         track = mido.MidiTrack()
 
@@ -119,48 +139,45 @@ class MIDI_parser():
         track.append(tempo)
         track.append(time_signature)
 
-        mask = features != self.pad_idx
-        features = features[mask]
+        mask = sounds != self.pad_idx
+        sounds = sounds[mask]
+        deltas = deltas[mask]
 
-        prev_time = 0
+        for sound, delta in zip(sounds, deltas):
 
-        for feature in features:
+            delta_idx = delta - 1
+            secs = self.idx_to_time[delta_idx]
+            ticks = self.secs_to_ticks(secs)
 
             # note_on
-            if feature < self.note_off_offset and feature >= self.note_on_offset:
+            if sound < self.note_off_offset and sound >= self.note_on_offset:
 
-                note = feature - self.note_on_offset
+                note = sound - self.note_on_offset
+                note *= self.note_ratio
                 msg = mido.Message('note_on', channel=0, note=note,
-                                   velocity=self.vel_value, time=prev_time)
+                                   velocity=self.vel_value, time=ticks)
                 track.append(msg)
 
             # note_off
-            elif feature < self.cc_offset:
+            elif sound < self.cc_offset:
 
-                note = feature - self.note_off_offset
+                note = sound - self.note_off_offset
+                note *= self.note_ratio
                 msg = mido.Message('note_on', channel=0,
-                                   note=note, velocity=0, time=prev_time)
+                                   note=note, velocity=0, time=ticks)
                 track.append(msg)
 
             # control_change
-            elif feature < self.time_offset:
+            elif sound <= self.n_sounds:
 
-                cc_idx = feature - self.cc_offset
+                cc_idx = sound - self.cc_offset
                 cc_control = self.cc_kept[cc_idx // 2]
                 cc_value = self.cc_upper if cc_idx % 2 else self.cc_lower
-                msg = mido.Message(
-                    'control_change', channel=0, control=cc_control, value=cc_value, time=prev_time)
+                msg = mido.Message('control_change', channel=0,
+                                   control=cc_control, value=cc_value, time=ticks)
                 track.append(msg)
 
-            # time_shift
-            elif feature < self.n_classes:
-
-                time_idx = feature - self.time_offset
-                secs = self.idx_to_time[time_idx]
-                ticks = self.secs_to_ticks(secs)
-                prev_time = ticks
-
-        end_of_track = mido.MetaMessage('end_of_track', time=prev_time)
+        end_of_track = mido.MetaMessage('end_of_track', time=ticks)
         track.append(end_of_track)
 
         midi = mido.MidiFile()
@@ -171,15 +188,15 @@ class MIDI_parser():
     def preprocess_dataset(self, src_filenames, dst_dir, batch_size, dst_filenames=None):
 
         assert len(src_filenames) >= batch_size
-        if dst_filenames:
+        if not dst_filenames is None:
             assert len(set(dst_filenames)) == len(src_filenames)
-            assert not re.findall(r'\/', ''.join(dst_filenames))
+            assert re.findall('\/', ''.join(dst_filenames)) is None
             dst_filenames = [f if f.endswith(
-                '.npy') else f + '.npy' for f in dst_filenames]
+                '.npz') else f + '.npz' for f in dst_filenames]
             dst_filenames = [os.path.join(dst_dir, f) for f in dst_filenames]
         else:
             dst_filenames = [os.path.join(dst_dir, str(
-                f) + '.npy') for f in list(range(len(src_filenames)))]
+                f) + '.npz') for f in list(range(len(src_filenames)))]
 
         for idx in tqdm.tqdm(range(0, len(src_filenames), batch_size)):
 
@@ -189,21 +206,31 @@ class MIDI_parser():
             for features, f in zip(features_list, dst_filenames[idx: idx + batch_size]):
                 self.save_features(features, f)
 
-    def get_tf_dataset(self, file_directory, batch_size, buffer_size, n_samples=None):
+    def get_tf_dataset(self, file_directory, batch_size, n_samples=None):
 
-        filenames = sorted(glob.glob(os.path.join(file_directory, '*.npy')))
+        filenames = sorted(glob.glob(os.path.join(file_directory, '*.npz')))
         assert len(filenames) > 0
 
         if n_samples:
-            assert isinstance(n_samples, int)
             n_samples = min(n_samples, len(filenames))
             filenames = np.random.choice(
                 filenames, n_samples, replace=False).tolist()
 
-        feature_list = [self.load_features(file) for file in filenames]
-        features_ragged = tf.ragged.constant(feature_list)
+        buffer_size = len(filenames)
 
-        tf_dataset = tf.data.Dataset.from_tensor_slices((features_ragged))
+        #feature_list = joblib.Parallel(n_jobs=self.n_jobs)(joblib.delayed(self.load_features)(file) for file in filenames)
+        feature_list = [self.load_features(file) for file in filenames]
+        sound_list = [x[0] for x in feature_list]
+        delta_list = [x[1] for x in feature_list]
+        sound_ragged = tf.ragged.constant(sound_list)
+        delta_ragged = tf.ragged.constant(delta_list)
+
+        dataset_sound = tf.data.Dataset.from_tensor_slices(sound_ragged)
+        dataset_delta = tf.data.Dataset.from_tensor_slices(delta_ragged)
+
+        tf_dataset = tf.data.Dataset.zip((dataset_sound, dataset_delta))
+        tf_dataset = tf.data.Dataset.from_tensor_slices(
+            (sound_ragged, delta_ragged))
         tf_dataset = tf_dataset.cache()
         tf_dataset = tf_dataset.shuffle(buffer_size).batch(
             batch_size, drop_remainder=True)
@@ -211,34 +238,51 @@ class MIDI_parser():
 
         return tf_dataset
 
-    def get_class_weights(self, file_directory, T=1.4):
+    def get_bigram_probs(self, npz_dir):
+        '''
+            Returns a matrix of conditional probablilties:
+            P[D=d | S=s, S_prev=s_prev], where:
+                D is the delta of the current timestamp
+                S is the sound of the current timestamp
+                S_prev is the sound of the previous timestamp
 
-        class_counter = Counter()
-        npy_filenames = sorted(
-            glob.glob(os.path.join(file_directory, '*.npy')))
-        assert len(npy_filenames) > 0
+        '''
 
-        for file in tqdm.tqdm_notebook(npy_filenames):
+        npz_files = pathlib.Path(npz_dir).rglob('*.npz')
+        npz_files = [str(f) for f in npz_files]
+        assert len(npz_files) > 0
 
-            arr = np.load(file)
-            class_counter.update(arr)
+        freqs = np.zeros((self.n_sounds, self.n_sounds,
+                          self.n_deltas), dtype=np.int32)
 
-        class_freqs = np.zeros((self.n_classes), dtype=np.int32)
-        for class_, freq in class_counter.items():
-            class_freqs[class_] = freq
+        sound_list, delta_list = zip(*list(map(self.load_features, npz_files)))
 
-        eps = 1e-5
+        for sounds, deltas in tqdm.tqdm(zip(sound_list, delta_list)):
 
-        zero_mask = class_freqs == 0
+            for idx, (sound, delta) in enumerate(zip(sounds[1:], deltas[1:])):
 
-        # smoothe
-        smoothed_freqs = np.exp(np.log(1 + class_freqs) / T)
-        # normalize
-        smoothed_probs = smoothed_freqs / np.sum(smoothed_freqs)
+                freqs[sound, sounds[idx - 1], delta] += 1
 
-        smoothed_weights = 1 / (eps + smoothed_probs)
-        smoothed_weights[zero_mask] = 0
-        norm_coef = np.sum(smoothed_weights * smoothed_probs)
-        final_weights = smoothed_weights / norm_coef
+        freqs_sum = np.sum(freqs, axis=-1)
+        zero_mask = freqs_sum == 0
+        freqs_sum[zero_mask] = 1
+        freqs_sum = freqs_sum[:, :, np.newaxis]
 
-        return final_weights
+        freqs_norm = freqs / freqs_sum
+
+        return freqs_norm
+
+    @staticmethod
+    def build_from_config(config, idx_to_time):
+
+        parser = MIDI_parser(tempo=config.tempo, ppq=config.ppq,
+                             numerator=config.numerator, denominator=config.denominator,
+                             clocks_per_click=config.clocks_per_click,
+                             notated_32nd_notes_per_beat=config.notated_32nd_notes_per_beat,
+                             cc_kept=config.cc_kept, cc_threshold=config.cc_threshold,
+                             cc_lower=config.cc_lower, cc_upper=config.cc_upper,
+                             n_notes=config.n_notes, n_deltas=config.n_deltas,
+                             vel_value=config.vel_value, idx_to_time=idx_to_time,
+                             n_jobs=config.n_jobs)
+
+        return parser

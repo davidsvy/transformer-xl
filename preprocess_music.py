@@ -12,9 +12,9 @@ if __name__ == '__main__':
     arg_parser = argparse.ArgumentParser()
     arg_parser.add_argument('-m', '--midi_dir', type=str, default='maestro',
                             help='Directory where the midi files are stored')
-    arg_parser.add_argument('-np', '--npy_dir', type=str, default='npy_music',
-                            help='Directory where the npy files will be stored')
-    arg_parser.add_argument('-n', '--n_files', type=int, default=-1,
+    arg_parser.add_argument('-np', '--npz_dir', type=str, default='npz_music',
+                            help='Directory where the npz files will be stored')
+    arg_parser.add_argument('-n', '--n_files', type=int, default=None,
                             help='Number of files to take into account (default: all)')
     arg_parser.add_argument('-d', '--download', action='store_true',
                             help='If activated the MAESTRO dataset will be downloaded (mandatory for the first time)')
@@ -27,12 +27,15 @@ if __name__ == '__main__':
         else:
             assert pathlib.Path(args.midi_dir).is_dir()
 
-    if pathlib.Path(args.npy_dir).exists():
-        assert pathlib.Path(args.npy_dir).is_dir()
+    if pathlib.Path(args.npz_dir).exists():
+        assert pathlib.Path(args.npz_dir).is_dir()
     else:
-        pathlib.Path(args.npy_dir).mkdir(parents=True, exist_ok=True)
+        pathlib.Path(args.npz_dir).mkdir(parents=True, exist_ok=True)
 
-    assert isinstance(args.n_files, int)
+    if not args.n_files is None:
+        assert isinstance(args.n_files, int)
+        assert args.n_files > 0
+
     # ============================================================
     # ============================================================
 
@@ -42,26 +45,28 @@ if __name__ == '__main__':
         print('Downloading dataset...')
         dload.save_unzip(config.dataset_url, args.midi_dir)
 
-    midi_filenames = list(pathlib.Path(args.midi_dir).rglob('*.midi'))
-    midi_filenames = list(map(lambda x: str(x), midi_filenames))
+    ext_list = ['*.midi', '*.mid']
+
+    midi_filenames = []
+    for ext in ext_list:
+        ext_filenames = pathlib.Path(args.midi_dir).rglob(ext)
+        ext_filenames = list(map(lambda x: str(x), ext_filenames))
+        midi_filenames += ext_filenames
+    print(f'Found {len(midi_filenames)} midi files')
     assert len(midi_filenames) > 0
 
-    if args.n_files > 0:
+    if not args.n_files is None:
         n_files = max(0, min(args.n_files, len(midi_filenames)))
         midi_filenames = np.random.choice(
             midi_filenames, n_files, replace=False)
+        assert len(midi_filenames) > 0
 
     idx_to_time = get_quant_time()
 
-    midi_parser = MIDI_parser(
-        tempo=config.tempo, ppq=config.ppq, numerator=config.numerator,
-        denominator=config.denominator, clocks_per_click=config.clocks_per_click,
-        notated_32nd_notes_per_beat=config.notated_32nd_notes_per_beat,
-        cc_kept=config.cc_kept, cc_threshold=config.cc_threshold, cc_lower=config.cc_lower,
-        cc_upper=config.cc_upper, n_notes=config.n_notes, n_times=config.n_times,
-        vel_value=config.vel_value, idx_to_time=idx_to_time, n_jobs=config.n_jobs)
+    midi_parser = MIDI_parser.build_from_config(config, idx_to_time)
 
-    print('Creating npy files...')
-    midi_parser.preprocess_dataset(
-        src_filenames=midi_filenames, dst_dir=args.npy_dir, batch_size=20)
+    print('Creating npz files...')
+    midi_parser.preprocess_dataset(src_filenames=midi_filenames,
+                                   dst_dir=args.npz_dir, batch_size=20, dst_filenames=None)
+
     print(f'Created dataset with {len(midi_filenames)} files')

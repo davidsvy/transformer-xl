@@ -1,8 +1,11 @@
 import tensorflow as tf
 import numpy as np
+import tqdm
 
 __all__ = ('pad_ragged_2d', 'shuffle_ragged_2d',
-           'inputs_to_labels', 'get_pos_encoding', 'get_quant_time')
+           'inputs_to_labels', 'get_pos_encoding',
+           'get_quant_time', 'softmax_with_temp',
+           'generate_midis')
 
 
 def pad_ragged_2d(ragged_tensor, pad_idx):
@@ -23,26 +26,35 @@ def pad_ragged_2d(ragged_tensor, pad_idx):
     return padded_tensor
 
 
-def shuffle_ragged_2d(ragged_tensor, pad_idx):
+def shuffle_ragged_2d(ragged_tensors, pad_idx):
+
+    if not isinstance(ragged_tensors, (list, tuple)):
+        ragged_tensors = [ragged_tensors]
 
     # ragged_tensor -> RAGGED(batch_size, None)
-    lens = ragged_tensor.row_lengths(axis=-1)
-    second_lowest = -tf.nn.top_k(-lens, 2).values[-1]
-    shuffled_slices = []
+    lens = ragged_tensors[0].row_lengths(axis=-1)
+    second_lowest = -tf.nn.top_k(-lens, 5).values[-1]
+    shuffled_tensors = [[] for _ in ragged_tensors]
 
-    for len_, row in zip(lens, ragged_tensor):
+    for len_, *rows in zip(lens, *ragged_tensors):
+
+        assert all(row.shape[0] == len_ for row in rows)
         if len_ <= second_lowest:
-            new_row = tf.pad(
-                row, paddings=[[0, second_lowest - len_]], constant_values=pad_idx)
+            new_rows = [tf.pad(row, paddings=[[0, second_lowest - len_]],
+                               constant_values=pad_idx) for row in rows]
         else:
             start_idx = tf.random.uniform(
                 (), minval=0, maxval=len_ - second_lowest + 1, dtype=tf.int64)
-            new_row = row[start_idx: start_idx + second_lowest]
-        shuffled_slices.append(new_row[tf.newaxis, :])
+            new_rows = [row[start_idx: start_idx + second_lowest]
+                        for row in rows]
 
-    shuffled_tensor = tf.concat(shuffled_slices, axis=0)
+        for tensor, row in zip(shuffled_tensors, new_rows):
+            tensor.append(row[tf.newaxis, :])
 
-    return shuffled_tensor
+    shuffled_tensors = [tf.concat(shuffled_tensor, axis=0)
+                        for shuffled_tensor in shuffled_tensors]
+
+    return shuffled_tensors
 
 
 def inputs_to_labels(inputs, pad_idx):
@@ -80,10 +92,10 @@ def get_pos_encoding(seq_len, d_model):
 def get_quant_time():
 
     step = 0.001
-    coef = 1.1
+    coef = 1.16
     delta = 0
-    total_reps = 120
-    local_reps = 3
+    total_reps = 64
+    local_reps = 2
     quant_time = []
     for _ in range(total_reps // local_reps):
         for _ in range(local_reps):
@@ -105,3 +117,97 @@ def softmax_with_temp(x, temp=1.0):
     x = x / np.sum(x) / temp
     x = tf.nn.softmax(x).numpy()
     return x
+
+
+def generate_midis(model, seq_len, mem_len, max_len, parser, filenames, pad_idx, top_k=1, temp=1.0):
+
+    assert isinstance(seq_len, int)
+    assert seq_len > 0
+
+    assert isinstance(mem_len, int)
+    assert mem_len >= 0
+
+    assert isinstance(max_len, int)
+    assert max_len > 1
+
+    batch_size = len(filenames)
+
+    sounds, deltas = zip(*[parser.load_features(filename)
+                           for filename in filenames])
+
+    min_len = min([len(s) for s in sounds])
+
+    orig_len = np.random.randint(1, min(2 * mem_len, min_len))
+    assert orig_len >= 1
+
+    sounds = np.array([sound[:orig_len] for sound in sounds])
+    deltas = np.array([delta[:orig_len] for delta in deltas])
+    # sounds -> (batch_size, orig_len)
+
+    full_len = mem_len + seq_len - 1
+
+    inputs_sound = tf.constant(sounds[:, -seq_len:])
+    inputs_delta = tf.constant(deltas[:, -seq_len:])
+
+    outputs_sound, outputs_delta, next_mem_list, attention_weight_list, attention_loss_list = model(
+        inputs=(inputs_sound, inputs_delta),
+        mem_list=None,
+        next_mem_len=mem_len,
+        training=False
+    )
+
+    for _ in tqdm.tqdm(range(max_len)):
+
+        outputs_sound = outputs_sound[:, -1, :]
+        probs_sound = tf.nn.softmax(outputs_sound, axis=-1).numpy()
+        probs_sound[:, pad_idx] = 0
+        # probs_sound -> (batch_size, n_sounds)
+
+        outputs_delta = outputs_delta[:, -1, :]
+        probs_delta = tf.nn.softmax(outputs_delta, axis=-1).numpy()
+        probs_delta[:, pad_idx] = 0
+        # probs_delta -> (batch_size, n_deltas)
+
+        new_sounds = []
+
+        for batch_probs in probs_sound:
+
+            best_idxs = batch_probs.argsort()[-top_k:][::-1]
+            best_probs = softmax_with_temp(batch_probs[best_idxs], temp)
+            new_sound = np.random.choice(best_idxs, p=best_probs)
+            new_sounds.append(new_sound)
+
+        new_sounds = np.array(new_sounds)[:, np.newaxis]
+        # new_sounds -> (batch_size, 1)
+        sounds = np.concatenate((sounds, new_sounds), axis=-1)
+
+        new_deltas = []
+
+        for batch_probs in probs_delta:
+
+            best_idxs = batch_probs.argsort()[-top_k:][::-1]
+            best_probs = softmax_with_temp(batch_probs[best_idxs], temp)
+            new_delta = np.random.choice(best_idxs, p=best_probs)
+            new_deltas.append(new_delta)
+
+        new_deltas = np.array(new_deltas)[:, np.newaxis]
+        # new_deltas -> (batch_size, 1)
+        deltas = np.concatenate((deltas, new_deltas), axis=-1)
+
+        inputs_sound = tf.constant(new_sounds)
+        inputs_delta = tf.constant(new_deltas)
+
+        outputs_sound, outputs_delta, next_mem_list, attention_weight_list, attention_loss_list = model(
+            inputs=(inputs_sound, inputs_delta),
+            mem_list=next_mem_list,
+            next_mem_len=mem_len,
+            training=False
+        )
+
+    sounds = sounds[:, orig_len:]
+    deltas = deltas[:, orig_len:]
+
+    midi_list = [parser.features_to_midi(
+        sound, delta) for sound, delta in zip(sounds, deltas)]
+
+    return midi_list, next_mem_list, attention_weight_list, attention_loss_list
