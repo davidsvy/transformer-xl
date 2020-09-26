@@ -201,13 +201,15 @@ if __name__ == '__main__':
 
             progress_bar.add(1, values=values)
 
-        checkpoint_path = os.path.join(
-            args.checkpoint_dir, f'checkpoint{epoch}.h5')
-        model.save_weights(checkpoint_path)
+        if epoch % args.checkpoint_period == 0:
 
-        optimizer_path = os.path.join(
-            args.checkpoint_dir, f'optimizer{epoch}.npy')
-        np.save(optimizer_path, optimizer.get_weights())
+            checkpoint_path = os.path.join(
+                args.checkpoint_dir, f'checkpoint{epoch}.h5')
+            model.save_weights(checkpoint_path)
 
-        print(f'Saved model weights at {checkpoint_path}')
-        print(f'Saved optimizer weights at {optimizer_path}')
+            optimizer_path = os.path.join(
+                args.checkpoint_dir, f'optimizer{epoch}.npy')
+            np.save(optimizer_path, optimizer.get_weights())
+
+            print(f'Saved model weights at {checkpoint_path}')
+            print(f'Saved optimizer weights at {optimizer_path}')
