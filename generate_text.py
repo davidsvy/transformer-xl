@@ -1,7 +1,7 @@
 from text_parser import Scam_parser
-from model import Transformer_XL
+from model import Gated_Transformer_XL
 import config_text as config
-from utils import softmax_with_temp
+from utils import softmax_with_temp, generate_text
 import numpy as np
 import tensorflow as tf
 import argparse
@@ -10,99 +10,6 @@ import pathlib
 import tqdm
 import pickle
 import re
-
-
-def generate_text(model, seq_len, mem_len, max_len, tokenizer, start_idx, end_idx, blocked_idxs,
-                  batch_size, beginning=None, top_k=1, temp=1.0):
-
-    if isinstance(beginning, str):
-        generated_idxs = tokenizer.texts_to_sequences([beginning])
-        generated_idxs = np.repeat(generated_idxs, batch_size, axis=0)
-        start_idxs = np.full((batch_size, 1), start_idx,
-                             dtype=generated_idxs.dtype)
-        generated_idxs = np.concatenate((start_idxs, generated_idxs), axis=-1)
-
-    elif isinstance(beginning, list):
-        assert len(beginning) == batch_size
-        for string in beginning:
-            assert isinstance(string, str)
-        generated_idxs = tokenizer.texts_to_sequences(beginning)
-        min_len = min([len(x) for x in generated_idxs])
-        generated_idxs = np.array([x[:min_len] for x in generated_idxs])
-        start_idxs = np.full((batch_size, 1), start_idx,
-                             dtype=generated_idxs.dtype)
-        generated_idxs = np.concatenate((start_idxs, generated_idxs), axis=-1)
-
-    else:
-        generated_idxs = np.full((batch_size, 1), start_idx)
-
-    end_flags = [False] * batch_size
-    end_cnt = 0
-
-    orig_len = generated_idxs.shape[1]
-    assert orig_len >= 1
-    # generated_idxs -> (batch_size, orig_len)
-
-    for _ in tqdm.tqdm(range(max_len - orig_len)):
-
-        if generated_idxs.shape[1] <= seq_len:
-
-            inputs = tf.constant(generated_idxs, dtype=tf.int32)
-            # inputs -> (batch_size, cur_length)
-
-            outputs, _ = model(inputs=inputs,
-                               mem_list=None,
-                               next_mem_len=None,
-                               training=False)
-
-        else:
-
-            cur_mem_len = min(mem_len, generated_idxs.shape[1] - seq_len)
-            memory = generated_idxs[:, -(cur_mem_len + seq_len):-seq_len]
-            memory = tf.constant(memory, dtype=tf.int32)
-            # memory -> (batch_size, cur_mem_len)
-
-            _, mem_list = model(inputs=memory,
-                                mem_list=None,
-                                next_mem_len=mem_len,
-                                training=False)
-
-            # insert input
-            inputs = generated_idxs[:, -seq_len:]
-            inputs = tf.constant(inputs, dtype=tf.int32)
-
-            # outputs -> (batch_size, cur_length, num_words)
-            outputs, _ = model(inputs=inputs,
-                               mem_list=mem_list,
-                               next_mem_len=None,
-                               training=False)
-
-        outputs = tf.nn.softmax(outputs, axis=-1)
-
-        probs = outputs[:, -1, :].numpy()
-        # probs -> (batch_size, num_words)
-        if not blocked_idxs is None:
-            probs[:, blocked_idxs] = 0
-
-        generated_new = []
-        for batch_idx, batch_probs in enumerate(probs):
-
-            best_idxs = batch_probs.argsort()[-top_k:][::-1]
-            best_probs = softmax_with_temp(batch_probs[best_idxs], temp)
-            new_idx = np.random.choice(best_idxs, p=best_probs)
-            generated_new.append(new_idx)
-            if new_idx == end_idx and not end_flags[batch_idx]:
-                end_flags[batch_idx] = True
-                end_cnt += 1
-
-        generated_new = np.array(generated_new)[:, np.newaxis]
-        # generated_new -> (batch_size, 1)
-        generated_idxs = np.concatenate(
-            (generated_idxs, generated_new), axis=-1)
-        if end_cnt >= batch_size:
-            break
-
-    return generated_idxs
 
 
 if __name__ == '__main__':
@@ -122,11 +29,11 @@ if __name__ == '__main__':
                             help='Path where the generated text will be stored')
 
     arg_parser.add_argument('-l', '--gen_len', type=int, default=1000,
-                            help='Maximum length of the generated text (in words)')
+                            help='Maximum length of the generated text (in tokens)')
 
-    arg_parser.add_argument('-k', '--top_k', type=int, default=6)
+    arg_parser.add_argument('-k', '--top_k', type=int, default=3)
 
-    arg_parser.add_argument('-t', '--temp', type=float, default=0.5,
+    arg_parser.add_argument('-t', '--temp', type=float, default=0.4,
                             help='Temperature of softmax')
 
     arg_parser.add_argument('-bl', '--beginning_list',
@@ -184,15 +91,15 @@ if __name__ == '__main__':
     else:
         beginning = None
 
-    model = Transformer_XL.build_from_config(
+    model, _ = Gated_Transformer_XL.build_from_config(
         config=config, checkpoint_path=args.checkpoint_path)
 
-    generated_features = generate_text(model=model, seq_len=config.seq_len,
-                                       mem_len=config.mem_len, max_len=args.gen_len,
-                                       tokenizer=tokenizer, start_idx=start_idx,
-                                       end_idx=end_idx, blocked_idxs=blocked_idxs,
-                                       batch_size=args.n_samples, beginning=beginning,
-                                       top_k=args.top_k, temp=args.temp)
+    generated_features, _ = generate_text(model=model, seq_len=config.seq_len,
+                                          mem_len=config.mem_len, max_len=args.gen_len,
+                                          tokenizer=tokenizer, start_idx=start_idx,
+                                          end_idx=end_idx, blocked_idxs=blocked_idxs,
+                                          batch_size=args.n_samples, beginning=beginning,
+                                          top_k=args.top_k, temp=args.temp)
 
     generated_texts = scam_parser.features_to_text(features=generated_features,
                                                    tokenizer=tokenizer,

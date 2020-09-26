@@ -409,7 +409,7 @@ class Scam_parser():
         print(f'The tokenizer is stored at {tokenizer_path}')
         print(f'The tokens dictionary is stored at {stored_tokens_path}')
 
-    def get_tf_dataset(self, file_directory, batch_size, buffer_size, n_samples=None):
+    def get_tf_dataset(self, file_directory, batch_size, n_samples=None):
 
         filenames = list(pathlib.Path(file_directory).rglob('*.npy'))
         assert len(filenames) > 0
@@ -420,7 +420,10 @@ class Scam_parser():
             filenames = np.random.choice(
                 filenames, n_samples, replace=False).tolist()
 
-        feature_list = [self.load_features(file) for file in filenames]
+        buffer_size = len(filenames)
+        assert buffer_size > 0
+
+        feature_list = list(map(self.load_features, filenames))
         features_ragged = tf.ragged.constant(feature_list)
 
         tf_dataset = tf.data.Dataset.from_tensor_slices((features_ragged))

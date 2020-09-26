@@ -34,6 +34,6 @@ if __name__ == '__main__':
 
     scam_parser = Scam_parser.build_from_config(config)
     scam_parser.preprocess_dataset(corpus_path=args.corpus_path,
-                                   n_words=config.n_words,
+                                   n_words=config.n_classes,
                                    npy_dir=args.npy_dir,
                                    tokenizer=args.tokenizer)

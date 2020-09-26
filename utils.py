@@ -26,26 +26,26 @@ def pad_ragged_2d(ragged_tensor, pad_idx):
     return padded_tensor
 
 
-def shuffle_ragged_2d(ragged_tensors, pad_idx):
+def shuffle_ragged_2d(ragged_tensors, pad_idx, lowest_idx=5):
 
     if not isinstance(ragged_tensors, (list, tuple)):
         ragged_tensors = [ragged_tensors]
 
     # ragged_tensor -> RAGGED(batch_size, None)
     lens = ragged_tensors[0].row_lengths(axis=-1)
-    second_lowest = -tf.nn.top_k(-lens, 5).values[-1]
+    kth_lowest = -tf.nn.top_k(-lens, lowest_idx).values[-1]
     shuffled_tensors = [[] for _ in ragged_tensors]
 
     for len_, *rows in zip(lens, *ragged_tensors):
 
         assert all(row.shape[0] == len_ for row in rows)
-        if len_ <= second_lowest:
-            new_rows = [tf.pad(row, paddings=[[0, second_lowest - len_]],
+        if len_ <= kth_lowest:
+            new_rows = [tf.pad(row, paddings=[[0, kth_lowest - len_]],
                                constant_values=pad_idx) for row in rows]
         else:
             start_idx = tf.random.uniform(
-                (), minval=0, maxval=len_ - second_lowest + 1, dtype=tf.int64)
-            new_rows = [row[start_idx: start_idx + second_lowest]
+                (), minval=0, maxval=len_ - kth_lowest + 1, dtype=tf.int64)
+            new_rows = [row[start_idx: start_idx + kth_lowest]
                         for row in rows]
 
         for tensor, row in zip(shuffled_tensors, new_rows):
@@ -211,3 +211,84 @@ def generate_midis(model, seq_len, mem_len, max_len, parser, filenames, pad_idx,
         sound, delta) for sound, delta in zip(sounds, deltas)]
 
     return midi_list, next_mem_list, attention_weight_list, attention_loss_list
+
+
+def generate_text(model, seq_len, mem_len, max_len, tokenizer, start_idx, end_idx, blocked_idxs,
+                  batch_size, beginning=None, top_k=3, temp=0.4):
+
+    if isinstance(beginning, str):
+        words = tokenizer.texts_to_sequences([beginning])
+        words = np.repeat(words, batch_size, axis=0)
+        start_idxs = np.full((batch_size, 1), start_idx,
+                             dtype=words.dtype)
+        words = np.concatenate((start_idxs, words), axis=-1)
+
+    elif isinstance(beginning, list):
+        assert len(beginning) == batch_size
+        for string in beginning:
+            assert isinstance(string, str)
+        words = tokenizer.texts_to_sequences(beginning)
+        min_len = min([len(x) for x in words])
+        words = np.array([x[:min_len] for x in words])
+        start_idxs = np.full((batch_size, 1), start_idx,
+                             dtype=words.dtype)
+        words = np.concatenate((start_idxs, words), axis=-1)
+
+    else:
+        words = np.full((batch_size, 1), start_idx)
+
+    end_flags = [False] * batch_size
+    end_cnt = 0
+
+    orig_len = words.shape[1]
+    assert orig_len >= 1
+    # words -> (batch_size, orig_len)
+
+    # ================================
+
+    inputs = tf.constant(words[:, -seq_len:])
+
+    outputs, next_mem_list, attention_weight_list, attention_loss_list = model(
+        inputs=inputs,
+        mem_list=None,
+        next_mem_len=mem_len,
+        training=False
+    )
+
+    for _ in tqdm.tqdm(range(max_len)):
+
+        outputs = outputs[:, -1, :]
+        probs = tf.nn.softmax(outputs, axis=-1).numpy()
+        probs[:, blocked_idxs] = 0
+        # probs -> (batch_size, n_words)
+
+        new_words = []
+
+        for batch_idx, batch_probs in enumerate(probs):
+
+            best_idxs = batch_probs.argsort()[-top_k:][::-1]
+            best_probs = softmax_with_temp(batch_probs[best_idxs], temp)
+            new_word = np.random.choice(best_idxs, p=best_probs)
+            new_words.append(new_word)
+
+            if new_word == end_idx and not end_flags[batch_idx]:
+                end_flags[batch_idx] = True
+                end_cnt += 1
+
+        new_words = np.array(new_words)[:, np.newaxis]
+        # new_words -> (batch_size, 1)
+        words = np.concatenate((words, new_words), axis=-1)
+
+        if end_cnt >= batch_size:
+            break
+
+        inputs = tf.constant(new_words)
+
+        outputs, next_mem_list, attention_weight_list, attention_loss_list = model(
+            inputs=inputs,
+            mem_list=next_mem_list,
+            next_mem_len=mem_len,
+            training=False
+        )
+
+    return words, end_flags

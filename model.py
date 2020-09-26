@@ -2,7 +2,7 @@ import tensorflow as tf
 import numpy as np
 from utils import get_pos_encoding
 
-__all__ = ('Music_transformer')
+__all__ = ('Music_transformer', 'Gated_Transformer_XL')
 
 
 def gelu(x):
@@ -545,6 +545,206 @@ class Music_transformer(tf.keras.Model):
 
             init_inputs = tf.zeros((4, 42), dtype=tf.int32)
             _ = model(inputs=(init_inputs, init_inputs), mem_list=None,
+                      next_mem_len=None, training=False)
+
+            model.load_weights(checkpoint_path)
+            print(f'Loaded model weights from {checkpoint_path}')
+
+        optimizer = tf.keras.optimizers.Adam(lr=config.lr)
+
+        if not optimizer_path is None:
+
+            optimizer_weights = np.load(optimizer_path, allow_pickle=True)
+            grad_vars = model.trainable_weights
+            zero_grads = [tf.zeros_like(w) for w in grad_vars]
+            optimizer.apply_gradients(zip(zero_grads, grad_vars))
+            optimizer.set_weights(optimizer_weights)
+            print(f'Loaded optimizer from {optimizer_path}')
+
+        return model, optimizer
+
+
+class Gated_Transformer_XL(tf.keras.Model):
+
+    def __init__(self, d_model, n_heads, n_layers,
+                 n_classes, dropout_rate, pad_idx,
+                 class_weights=None, max_seq_len=2048, gating_type=None):
+
+        super(Gated_Transformer_XL, self).__init__()
+
+        assert d_model % n_heads == 0
+        assert 0.0 <= dropout_rate < 1.0
+
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.n_layers = n_layers
+        self.n_classes = n_classes
+        self.dropout_rate = dropout_rate
+        self.pad_idx = pad_idx
+
+        if not class_weights is None:
+            class_weights = tf.constant(class_weights, dtype=tf.float32)
+            assert class_weights.shape == (self.n_classes,)
+
+        self.class_weights = class_weights
+
+        self.emb_layer = tf.keras.layers.Embedding(
+            self.n_classes, self.d_model)
+        self.pos_enc = get_pos_encoding(max_seq_len, self.d_model)
+
+        self.layer_list = []
+        for _ in range(self.n_layers):
+
+            layer = Transformer_block(
+                self.d_model, self.n_heads, self.dropout_rate, gating_type)
+            self.layer_list.append(layer)
+
+        self.dropout1 = tf.keras.layers.Dropout(
+            self.dropout_rate, name='dropout1')
+        self.hidden = tf.keras.layers.Dense(
+            self.d_model, activation='gelu', name='hidden')
+        self.dropout2 = tf.keras.layers.Dropout(
+            self.dropout_rate, name='dropout2')
+        self.final = tf.keras.layers.Dense(self.n_classes, name='final')
+
+    def get_look_ahead_mask(self, seq_len, mem_len):
+
+        mask = 1 - tf.linalg.band_part(tf.ones((seq_len, seq_len)), -1, 0)
+        # mask -> (seq_len, seq_len)
+        if mem_len > 0:
+
+            if mem_len < seq_len:
+                mem_mask = 1 - \
+                    tf.linalg.band_part(
+                        tf.ones((seq_len, seq_len), dtype=mask.dtype), 0, -1)
+                mem_mask = mem_mask[:, -mem_len:]
+            else:
+                mem_mask = 1 - \
+                    tf.linalg.band_part(
+                        tf.ones((seq_len, mem_len), dtype=mask.dtype), 0, -1)
+
+            mask = tf.concat((mem_mask, mask), axis=-1)
+            # mask -> (seq_len, mem_len + seq_len)
+
+        mask = mask[tf.newaxis, tf.newaxis, :, :]
+        # mask -> (1, 1, seq_len, mem_len + seq_len)
+
+        return mask
+
+    def get_next_mem(self, prev_mem, next_mem, next_mem_len):
+
+        # prev_mem -> None or (batch_size, mem_len, d_model)
+        # next_mem -> (batch_size, seq_len, d_model)
+
+        if prev_mem is None or next_mem_len is None or next_mem_len == 0:
+            res = next_mem
+            # res -> (batch_size, seq_len, d_model)
+        else:
+            res = tf.concat((prev_mem, next_mem), axis=1)[
+                :, -(next_mem_len):, :]
+            # res -> (batch_size, next_mem_len, d_model)
+
+        res = tf.stop_gradient(res)
+
+        return res
+
+    def call(self, inputs, mem_list, next_mem_len, training):
+
+        # inputs -> (batch_size, seq_len)
+        # mem_list : list of (batch_size, mem_len, d_model) or None
+        # next_mem_len -> length of the next memory
+
+        batch_size = inputs.shape[0]
+        seq_len = inputs.shape[1]
+
+        if mem_list is None:
+            mem_len = 0
+            mem_list = [None] * self.n_layers
+        else:
+            mem_len = mem_list[0].shape[1]
+
+        full_len = seq_len + mem_len
+
+        mask = self.get_look_ahead_mask(seq_len, mem_len)
+        # mask -> (1, 1, seq_len, full_len)
+
+        rel_enc = self.pos_enc[:full_len, :]
+        rel_enc = tf.reverse(rel_enc, axis=[0])
+        # rel_enc -> (full_len, d_model)
+
+        next_mem_list = []
+        attention_weight_list = []
+        attention_loss_list = []
+
+        x = self.emb_layer(inputs)
+        x = x * tf.math.sqrt(tf.cast(self.d_model, tf.float32))
+        # x -> (batch_size, seq_len, d_model)
+
+        for idx, layer in enumerate(self.layer_list):
+
+            next_mem = self.get_next_mem(mem_list[idx], x, next_mem_len)
+            next_mem_list.append(next_mem)
+
+            x, attention_weights, attention_loss = layer(
+                x, mem_list[idx], mask, rel_enc, training)
+            attention_weight_list.append(attention_weights)
+            attention_loss_list.append(attention_loss)
+        # x -> (batch_size, seq_len, d_model)
+
+        x = self.dropout1(x, training=training)
+        x = self.hidden(x)
+        x = self.dropout2(x, training=training)
+        # x -> (batch_size, seq_len, d_model)
+
+        logits = self.final(x)
+        # logits -> (batch_size, seq_len, n_classes)
+
+        return logits, next_mem_list, attention_weight_list, attention_loss_list
+
+    def get_loss(self, logits, labels, attention_loss=None):
+
+        # logits -> (batch_size, seq_len, n_classes)
+        # labels -> (batch_size, seq_len)
+
+        pad_mask_bool = tf.math.not_equal(labels, self.pad_idx)
+        pad_mask = tf.cast(pad_mask_bool, dtype=tf.float32)
+        # pad_mask -> (batch_size, seq_len)
+
+        num_not_padded = tf.math.reduce_sum(pad_mask)
+        num_not_padded = tf.math.maximum(num_not_padded, 1.0)
+
+        loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
+            labels=labels, logits=logits)
+
+        if not self.class_weights is None:
+
+            class_weights = tf.gather_nd(
+                params=self.class_weights, indices=labels[..., tf.newaxis])
+            loss = loss * class_weights
+
+        loss = loss * pad_mask
+        # loss -> (batch_size, seq_len)
+
+        loss = tf.math.reduce_sum(loss) / num_not_padded
+        # loss -> ()
+
+        if not attention_loss is None:
+
+            loss += attention_loss
+
+        return loss, pad_mask_bool
+
+    @staticmethod
+    def build_from_config(config, checkpoint_path=None, optimizer_path=None):
+
+        model = Gated_Transformer_XL(d_model=config.d_model, n_heads=config.n_heads,
+                                     n_layers=config.n_layers, n_classes=config.n_classes,
+                                     dropout_rate=config.dropout_rate, pad_idx=config.pad_idx)
+
+        if not checkpoint_path is None:
+
+            init_inputs = tf.zeros((4, 42), dtype=tf.int32)
+            _ = model(inputs=init_inputs, mem_list=None,
                       next_mem_len=None, training=False)
 
             model.load_weights(checkpoint_path)

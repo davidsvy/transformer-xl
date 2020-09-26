@@ -1,15 +1,14 @@
-n_words = 6000
-d_model = 256
+n_classes = 6000  # n_words
+d_model = 384
 seq_len = 128
-mem_len = seq_len
+mem_len = 2 * seq_len
 batch_size = 4
-buffer_size = 690
-n_heads = 2
-dropout_rate = 0.4
+n_heads = 6
+dropout_rate = 0.3
 n_layers = 8
 n_epochs = 200
 
-lr = 0.00003
+lr = 0.00002
 max_segs_per_batch = 8
 
 pad_idx = 0
