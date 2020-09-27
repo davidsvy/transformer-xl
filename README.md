@@ -30,9 +30,9 @@ The neural networks are tested on two separate tasks : music generation and text
 
 ## Model Architecture
 
-![image](https://github.com/davidsvy/transformer-xl/raw/master/readme/music_model.png)
-
-![image](https://github.com/davidsvy/transformer-xl/raw/master/readme/text_model.png)
+| Model for Music                                                                        | Model for Text                                                                        |
+| -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| ![image](https://github.com/davidsvy/transformer-xl/raw/master/readme/music_model.png) | ![image](https://github.com/davidsvy/transformer-xl/raw/master/readme/text_model.png) |
 
 <a  name="data"></a>
 
